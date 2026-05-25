@@ -1,0 +1,10 @@
+server:
+  host: "0.0.0.0"
+  port: 8086
+  mcp_path: "/mcp"
+
+fmp:
+  base_url: "https://financialmodelingprep.com"
+  api_path: "/stable"
+  timeout_seconds: 30
+  user_agent: "golang-local-fmp-mcp/0.1"

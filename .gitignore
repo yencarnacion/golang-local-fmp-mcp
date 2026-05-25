@@ -1,0 +1,14 @@
+.env
+/golang-local-fmp-mcp
+*.log
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon?
+__MACOSX/
+.Spotlight-V100/
+.Trashes/
+.fseventsd/
+.agents/
+.codex/
