@@ -3,11 +3,14 @@ package fmp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -19,6 +22,7 @@ type Client struct {
 	APIKey    string
 	UserAgent string
 	HTTP      *http.Client
+	limiter   *adaptiveLimiter
 }
 
 // New creates a configured client.
@@ -32,6 +36,7 @@ func New(baseURL, apiPath, apiKey, userAgent string, timeout time.Duration) *Cli
 		APIKey:    apiKey,
 		UserAgent: userAgent,
 		HTTP:      &http.Client{Timeout: timeout},
+		limiter:   newAdaptiveLimiter(),
 	}
 }
 
@@ -54,6 +59,15 @@ func (e *APIError) Error() string {
 // Returns the response body parsed as JSON (any: object, array, etc.).
 // The apikey query parameter is appended automatically and never logged.
 func (c *Client) Get(ctx context.Context, path string, params url.Values) (any, error) {
+	rate := 0
+	if c.limiter != nil {
+		var err error
+		rate, err = c.limiter.Wait(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	if params == nil {
 		params = url.Values{}
 	}
@@ -73,7 +87,11 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (any, 
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("http url=%s: %w", safeURL, err)
+		err = fmt.Errorf("http url=%s: %w", safeURL, err)
+		if c.limiter != nil {
+			c.limiter.RecordError(rate, err)
+		}
+		return nil, err
 	}
 	defer resp.Body.Close()
 
@@ -83,7 +101,11 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (any, 
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, &APIError{Status: resp.StatusCode, URL: safeURL, Body: string(body)}
+		err := &APIError{Status: resp.StatusCode, URL: safeURL, Body: string(body)}
+		if c.limiter != nil {
+			c.limiter.RecordError(rate, err)
+		}
+		return nil, err
 	}
 
 	if len(body) == 0 {
@@ -96,6 +118,90 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (any, 
 		return string(body), nil
 	}
 	return v, nil
+}
+
+var defaultRateTiersPerMinute = []int{750, 299, 249, 199, 149, 99, 59, 29}
+
+type adaptiveLimiter struct {
+	mu        sync.Mutex
+	tiers     []int
+	tierIndex int
+	next      time.Time
+}
+
+func newAdaptiveLimiter() *adaptiveLimiter {
+	tiers := append([]int(nil), defaultRateTiersPerMinute...)
+	return &adaptiveLimiter{tiers: tiers}
+}
+
+func (l *adaptiveLimiter) Wait(ctx context.Context) (int, error) {
+	l.mu.Lock()
+	now := time.Now()
+	waitUntil := l.next
+	if waitUntil.Before(now) {
+		waitUntil = now
+	}
+	rate := l.currentRateLocked()
+	l.next = waitUntil.Add(intervalForRate(rate))
+	l.mu.Unlock()
+
+	timer := time.NewTimer(time.Until(waitUntil))
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return rate, ctx.Err()
+	case <-timer.C:
+		return rate, nil
+	}
+}
+
+func (l *adaptiveLimiter) RecordError(rate int, err error) {
+	if !isRateLimitError(err) {
+		return
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.tierIndex >= len(l.tiers)-1 {
+		return
+	}
+	if rate != l.currentRateLocked() {
+		return
+	}
+
+	oldRate := l.tiers[l.tierIndex]
+	l.tierIndex++
+	newRate := l.tiers[l.tierIndex]
+	log.Printf("fmp rate limiter reducing request rate from %d/min to %d/min after upstream rate-limit error", oldRate, newRate)
+}
+
+func (l *adaptiveLimiter) currentRateLocked() int {
+	return l.tiers[l.tierIndex]
+}
+
+func intervalForRate(perMinute int) time.Duration {
+	if perMinute <= 0 {
+		perMinute = 1
+	}
+	return time.Minute / time.Duration(perMinute)
+}
+
+func isRateLimitError(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	if apiErr.Status == http.StatusTooManyRequests {
+		return true
+	}
+	body := strings.ToLower(apiErr.Body)
+	return strings.Contains(body, "rate limit") ||
+		strings.Contains(body, "too many requests") ||
+		strings.Contains(body, "limit reach") ||
+		strings.Contains(body, "limit reached") ||
+		strings.Contains(body, "reached your limit")
 }
 
 func redactAPIKey(raw string) string {
